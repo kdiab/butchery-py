@@ -377,7 +377,7 @@ class DrumDetector:
 if __name__ == "__main__":
     detector = DrumDetector(
         sample_rate=48000,
-        threshold=0.13,
+        threshold=0.04,
         input_device=2,  # BlackHole 2ch
         
         kick_threshold_mult=2.0, 
@@ -398,10 +398,9 @@ if __name__ == "__main__":
     # Show available devices
     detector.list_devices()
     
-    # You can also adjust parameters after creation:
-    # detector.set_kick_params(threshold_mult=1.5)  # Make kick MORE sensitive
-    # detector.set_hihat_params(threshold_mult=0.1)  # Make hi-hat more sensitive
-    # detector.set_snare_params(threshold_mult=1.5)  # Make snare less sensitive
+#    detector.set_kick_params(threshold_mult=1.5)  # Make kick MORE sensitive
+    detector.set_hihat_params(threshold_mult=0.1)  # Make hi-hat more sensitive
+  #  detector.set_snare_params(threshold_mult=1.5)  # Make snare less sensitive
     
     # Start detecting
     try:
