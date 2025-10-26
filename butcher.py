@@ -1,411 +1,389 @@
+#!/usr/bin/env python3
+import mido
+import sounddevice as sd
 import numpy as np
-import pyaudio
-import time
-from scipy import signal
-from collections import deque
+import sys
+import threading
+
+BUFFER_SIZE = 2048
+selected_device = None
+sample_rate = None
+selected_channel = None
+mode = None
+
+kick_threshold = 100.0
+snare_threshold = 100.0
+hihat_threshold = 100.0
+kick_debounce = 0.12        # 120ms
+snare_debounce = 0.08       # 80ms
+hihat_debounce = 0.05       # 50ms
+min_energy = 10.0
+
+outports = mido.get_output_names()
+out = None
 
 
-class DrumDetector:
-    def __init__(self, 
-                 sample_rate=48000, 
-                 chunk_size=1024, 
-                 threshold=0.23,
-                 input_device=2,
-                 # Kick detection parameters
-                 kick_threshold_mult=3.5,
-                 kick_snare_ratio=2.5,
-                 kick_hihat_ratio=3.0,
-                 kick_energy_mult=1.5,
-                 # Snare detection parameters
-                 snare_threshold_mult=1.2,
-                 snare_energy_mult=0.7,
-                 snare_kick_ratio=0.5,
-                 # Hi-hat detection parameters
-                 hihat_threshold_mult=0.15,
-                 hihat_kick_ratio=0.8,
-                 hihat_zcr_min=0.05,
-                 # Debug mode
-                 debug=False):
-        
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.threshold = threshold
-        self.input_device = input_device
-        self.debug = debug
-        
-        self.kick_threshold_mult = kick_threshold_mult
-        self.kick_snare_ratio = kick_snare_ratio
-        self.kick_hihat_ratio = kick_hihat_ratio
-        self.kick_energy_mult = kick_energy_mult
-        
-        self.snare_threshold_mult = snare_threshold_mult
-        self.snare_energy_mult = snare_energy_mult
-        self.snare_kick_ratio = snare_kick_ratio
-        
-        self.hihat_threshold_mult = hihat_threshold_mult
-        self.hihat_kick_ratio = hihat_kick_ratio
-        self.hihat_zcr_min = hihat_zcr_min
-        
-        self.audio = pyaudio.PyAudio()
-        self.stream = None
-        self.running = False
-        
-        self.start_time = time.time()
-        self.sample_count = 0
-        
-        self.debug_counter = 0
-        self.debug_interval = int(sample_rate * 0.5)  # Print debug every 0.5 seconds
-        
-        self.kick_holdoff = int(0.15 * sample_rate)   # 150ms
-        self.snare_holdoff = int(0.1 * sample_rate)   # 100ms
-        self.hihat_holdoff = int(0.06 * sample_rate)  # 60ms
-        
-        self.last_kick = 0
-        self.last_snare = 0
-        self.last_hihat = 0
-        
-        self.kick_env = 0.0
-        self.snare_env = 0.0
-        self.hihat_env = 0.0
-        self.total_env = 0.0
-        
-        self.kick_attack = 1 - np.exp(-1 / (0.01 * sample_rate))
-        self.kick_release = 1 - np.exp(-1 / (0.1 * sample_rate))
-        self.snare_attack = 1 - np.exp(-1 / (0.01 * sample_rate))
-        self.snare_release = 1 - np.exp(-1 / (0.1 * sample_rate))
-        self.hihat_attack = 1 - np.exp(-1 / (0.001 * sample_rate))
-        self.hihat_release = 1 - np.exp(-1 / (0.05 * sample_rate))
-        self.total_attack = 1 - np.exp(-1 / (0.01 * sample_rate))
-        self.total_release = 1 - np.exp(-1 / (0.1 * sample_rate))
-        
-        self.zcr_buffer_size = int(0.02 * sample_rate)
-        self.audio_buffer = deque(maxlen=self.zcr_buffer_size)
-        
-        self.design_filters()
-        
-        self.filters_initialized = False
-        self.kick_zi = None
-        self.snare_zi = None
-        self.hihat_zi = None
+last_detection = {'kick': 0, 'snare': 0, 'hihat': 0}
+start_time = None
+
+def select_mode():
+    print("\n" + "="*60)
+    print("SELECT MODE")
+    print("="*60)
+    print("[1] Debug")
+    print("[2] Butcher")
+    print()
     
-    def design_filters(self):
-        """Design Butterworth filters for each drum type"""
-        nyquist = self.sample_rate / 2
-        
-        kick_freq = 80 / nyquist
-        self.kick_b, self.kick_a = signal.butter(4, kick_freq, btype='low')
-        
-        snare_low = 150 / nyquist
-        snare_high = 400 / nyquist
-        self.snare_b, self.snare_a = signal.butter(4, [snare_low, snare_high], btype='band')
-        
-        hihat_freq = 8000 / nyquist
-        self.hihat_b, self.hihat_a = signal.butter(4, hihat_freq, btype='high')
-    
-    def init_filter_states(self, first_sample):
-        """Initialize filter states with first sample to avoid transients"""
-        self.kick_zi = signal.lfilter_zi(self.kick_b, self.kick_a) * first_sample
-        self.snare_zi = signal.lfilter_zi(self.snare_b, self.snare_a) * first_sample
-        self.hihat_zi = signal.lfilter_zi(self.hihat_b, self.hihat_a) * first_sample
-        self.filters_initialized = True
-    
-    def envelope_follower(self, sample, current_env, attack, release):
-        """Track amplitude envelope of a signal"""
-        sample_abs = abs(sample)
-        if sample_abs > current_env:
-            return current_env + attack * (sample_abs - current_env)
-        else:
-            return current_env + release * (sample_abs - current_env)
-    
-    def calculate_zcr(self):
-        """Calculate zero crossing rate"""
-        if len(self.audio_buffer) < 2:
-            return 0.0
-        
-        buffer = np.array(self.audio_buffer)
-        crossings = np.sum(np.abs(np.diff(np.sign(buffer))))
-        return crossings / (2 * len(buffer))
-    
-    def calculate_spectral_centroid(self, chunk):
-        """Calculate spectral centroid (brightness)"""
-        fft = np.fft.rfft(chunk)
-        magnitude = np.abs(fft)
-        freqs = np.fft.rfftfreq(len(chunk), 1 / self.sample_rate)
-        
-        if np.sum(magnitude) > 0:
-            centroid = np.sum(freqs * magnitude) / np.sum(magnitude)
-            return np.clip(centroid, 20, 20000)
-        return 1000.0
-    
-    def process_chunk(self, audio_chunk):
-        """Process a chunk of audio"""
-        current_time = time.time() - self.start_time
-        
-        if not self.filters_initialized:
-            self.init_filter_states(audio_chunk[0])
-        
-        kick_band, self.kick_zi = signal.lfilter(
-            self.kick_b, self.kick_a, audio_chunk, zi=self.kick_zi)
-        
-        snare_band, self.snare_zi = signal.lfilter(
-            self.snare_b, self.snare_a, audio_chunk, zi=self.snare_zi)
-        
-        hihat_band, self.hihat_zi = signal.lfilter(
-            self.hihat_b, self.hihat_a, audio_chunk, zi=self.hihat_zi)
-        
-        self.audio_buffer.extend(audio_chunk)
-        
-        for i in range(len(audio_chunk)):
-            self.sample_count += 1
-            
-            self.kick_env = self.envelope_follower(
-                kick_band[i], self.kick_env, self.kick_attack, self.kick_release)
-            
-            self.snare_env = self.envelope_follower(
-                snare_band[i], self.snare_env, self.snare_attack, self.snare_release)
-            
-            self.hihat_env = self.envelope_follower(
-                hihat_band[i], self.hihat_env, self.hihat_attack, self.hihat_release)
-            
-            self.total_env = self.envelope_follower(
-                audio_chunk[i], self.total_env, self.total_attack, self.total_release)
-            
-            self.detect_drums(current_time + (i / self.sample_rate), audio_chunk)
-    
-    def detect_drums(self, timestamp, chunk):
-        """Check if any drums should trigger"""
-        
-        if self.debug:
-            self.debug_counter += 1
-            if self.debug_counter >= self.debug_interval:
-                self.debug_counter = 0
-                print(f"\n[DEBUG @ {timestamp:.2f}s]")
-                print(f"  Kick env:  {self.kick_env:.4f} (needs > {self.threshold * self.kick_threshold_mult:.4f})")
-                print(f"  Snare env: {self.snare_env:.4f} (needs > {self.threshold * self.snare_threshold_mult:.4f})")
-                print(f"  Hihat env: {self.hihat_env:.4f} (needs > {self.threshold * self.hihat_threshold_mult:.4f})")
-                print(f"  Total env: {self.total_env:.4f}")
-                print(f"  ZCR: {self.calculate_zcr():.4f}")
-                
-                print(f"\n  Kick checks:")
-                print(f"    Env > threshold*mult: {self.kick_env:.4f} > {self.threshold * self.kick_threshold_mult:.4f} = {self.kick_env > (self.threshold * self.kick_threshold_mult)}")
-                print(f"    Env > snare*ratio: {self.kick_env:.4f} > {self.snare_env * self.kick_snare_ratio:.4f} = {self.kick_env > (self.snare_env * self.kick_snare_ratio)}")
-                print(f"    Env > hihat*ratio: {self.kick_env:.4f} > {self.hihat_env * self.kick_hihat_ratio:.4f} = {self.kick_env > (self.hihat_env * self.kick_hihat_ratio)}")
-                print(f"    Total > threshold*mult: {self.total_env:.4f} > {self.threshold * self.kick_energy_mult:.4f} = {self.total_env > (self.threshold * self.kick_energy_mult)}")
-        
-        kick_ok = (
-            self.kick_env > (self.threshold * self.kick_threshold_mult) and
-            self.kick_env > (self.snare_env * self.kick_snare_ratio) and
-            self.kick_env > (self.hihat_env * self.kick_hihat_ratio) and
-            self.total_env > (self.threshold * self.kick_energy_mult) and
-            (self.sample_count - self.last_kick) > self.kick_holdoff
-        )
-        
-        if kick_ok:
-            self.last_kick = self.sample_count
-            self.trigger_kick(timestamp, chunk)
-        
-        snare_ok = (
-            self.snare_env > (self.threshold * self.snare_threshold_mult) and
-            self.total_env > (self.threshold * self.snare_energy_mult) and
-            self.snare_env > (self.kick_env * self.snare_kick_ratio) and
-            (self.sample_count - self.last_snare) > self.snare_holdoff
-        )
-        
-        if snare_ok:
-            self.last_snare = self.sample_count
-            self.trigger_snare(timestamp, chunk)
-        
-        zcr = self.calculate_zcr()
-        hihat_ok = (
-            self.hihat_env > (self.threshold * self.hihat_threshold_mult) and
-            self.hihat_env > (self.kick_env * self.hihat_kick_ratio) and
-            zcr > self.hihat_zcr_min and
-            (self.sample_count - self.last_hihat) > self.hihat_holdoff
-        )
-        
-        if hihat_ok:
-            self.last_hihat = self.sample_count
-            self.trigger_hihat(timestamp, chunk)
-    
-    def trigger_kick(self, timestamp, chunk):
-        """Handle kick drum detection"""
-        centroid = self.calculate_spectral_centroid(chunk)
-        dominance = self.kick_env / (self.snare_env + 0.001)
-        
-        print(f"KICK @ {timestamp:.2f}s - Level: {self.kick_env:.3f}, "
-              f"Centroid: {centroid:.0f}Hz, Dominance: {dominance:.1f}")
-    
-    def trigger_snare(self, timestamp, chunk):
-        """Handle snare drum detection"""
-        centroid = self.calculate_spectral_centroid(chunk)
-        zcr = self.calculate_zcr()
-        
-        print(f"SNARE @ {timestamp:.2f}s - Level: {self.snare_env:.3f}, "
-              f"Centroid: {centroid:.0f}Hz, ZCR: {zcr:.2f}")
-    
-    def trigger_hihat(self, timestamp, chunk):
-        """Handle hi-hat detection"""
-        centroid = self.calculate_spectral_centroid(chunk)
-        zcr = self.calculate_zcr()
-        
-        print(f"HI-HAT @ {timestamp:.2f}s - Level: {self.hihat_env:.3f}, "
-              f"Centroid: {centroid:.0f}Hz, ZCR: {zcr:.2f}")
-    
-    def audio_callback(self, in_data, frame_count, time_info, status):
-        """Callback function for audio stream"""
-        if status:
-            print(f"Stream status: {status}")
-        
-        audio_data = np.frombuffer(in_data, dtype=np.float32)
-        
-        if len(audio_data) > 0:
-            self.process_chunk(audio_data)
-        
-        return (in_data, pyaudio.paContinue)
-    
-    def start(self):
-        """Start the drum detector"""
-        if self.running:
-            print("Detector already running")
-            return
-        
+    while True:
         try:
-            self.stream = self.audio.open(
-                format=pyaudio.paFloat32,
-                channels=1,
-                rate=self.sample_rate,
-                input=True,
-                input_device_index=self.input_device,
-                frames_per_buffer=self.chunk_size,
-                stream_callback=self.audio_callback
-            )
+            choice = input("Select mode (1-2): ")
             
-            self.running = True
-            self.start_time = time.time()
-            self.sample_count = 0
+            if choice == "1":
+                print("\nDebug selected\n")
+                return "debug"
+            elif choice == "2":
+                print("\nButcher selected\n")
+                return "butcher"
+            else:
+                print("enter 1 or 2")
+        except KeyboardInterrupt:
+            print("\nExiting")
+            sys.exit(0)
+
+
+def show_help():
+    print("\n" + "="*60)
+    print("LIVE PARAMETER CONTROLS")
+    print("="*60)
+    print("SENSITIVITY (energy thresholds):")
+    print("  k+ / k-  : Increase/decrease kick threshold")
+    print("  s+ / s-  : Increase/decrease snare threshold")
+    print("  h+ / h-  : Increase/decrease hi-hat threshold")
+    print()
+    print("DEBOUNCE (minimum time between triggers):")
+    print("  K+ / K-  : Increase/decrease kick debounce time")
+    print("  S+ / S-  : Increase/decrease snare debounce time")
+    print("  H+ / H-  : Increase/decrease hi-hat debounce time")
+    print()
+    print("OTHER:")
+    print("  m+ / m-  : Increase/decrease minimum energy threshold")
+    print("  midi     : Open MIDI out port")
+    print("  show     : Display current settings")
+    print("  help     : Show this menu")
+    print("="*60 + "\n")
+
+
+def show_settings():
+    print("\n" + "="*60)
+    print("CURRENT SETTINGS")
+    print("="*60)
+    print(f"Kick Threshold:    {kick_threshold:.1f}  |  Debounce: {kick_debounce*1000:.0f}ms")
+    print(f"Snare Threshold:   {snare_threshold:.1f}  |  Debounce: {snare_debounce*1000:.0f}ms")
+    print(f"Hi-hat Threshold:  {hihat_threshold:.1f}  |  Debounce: {hihat_debounce*1000:.0f}ms")
+    print(f"Minimum Energy:    {min_energy:.1f}")
+    print("="*60 + "\n")
+
+
+def parameter_control_thread():
+    global kick_threshold, snare_threshold, hihat_threshold
+    global kick_debounce, snare_debounce, hihat_debounce, min_energy
+    global out, outports 
+    
+    print("\ntype 'help' for parameter controls, 'show' for current settings\n")
+    
+    while True:
+        try:
+            cmd = input().strip()
             
-            print(f"\nDrum Detector Started")
-            print(f"Sample Rate: {self.sample_rate} Hz")
-            print(f"Threshold: {self.threshold}")
-            print(f"Input Device: {self.input_device}")
-            print("\nListening for drums... Press Ctrl+C to stop\n")
+            if cmd == "k+":
+                kick_threshold += 10.0
+                print(f"Kick threshold: {kick_threshold:.1f}")
+            elif cmd == "k-":
+                kick_threshold = max(10.0, kick_threshold - 10.0)
+                print(f"Kick threshold: {kick_threshold:.1f}")
+            elif cmd == "s+":
+                snare_threshold += 10.0
+                print(f"Snare threshold: {snare_threshold:.1f}")
+            elif cmd == "s-":
+                snare_threshold = max(10.0, snare_threshold - 10.0)
+                print(f"Snare threshold: {snare_threshold:.1f}")
+            elif cmd == "h+":
+                hihat_threshold += 10.0
+                print(f"Hi-hat threshold: {hihat_threshold:.1f}")
+            elif cmd == "h-":
+                hihat_threshold = max(10.0, hihat_threshold - 10.0)
+                print(f"Hi-hat threshold: {hihat_threshold:.1f}")
             
-            self.stream.start_stream()
+            elif cmd == "K+":
+                kick_debounce = min(0.30, kick_debounce + 0.01)
+                print(f"Kick debounce: {kick_debounce*1000:.0f}ms")
+            elif cmd == "K-":
+                kick_debounce = max(0.02, kick_debounce - 0.01)
+                print(f"Kick debounce: {kick_debounce*1000:.0f}ms")
+            elif cmd == "S+":
+                snare_debounce = min(0.30, snare_debounce + 0.01)
+                print(f"Snare debounce: {snare_debounce*1000:.0f}ms")
+            elif cmd == "S-":
+                snare_debounce = max(0.02, snare_debounce - 0.01)
+                print(f"Snare debounce: {snare_debounce*1000:.0f}ms")
+            elif cmd == "H+":
+                hihat_debounce = min(0.30, hihat_debounce + 0.01)
+                print(f"Hi-hat debounce: {hihat_debounce*1000:.0f}ms")
+            elif cmd == "H-":
+                hihat_debounce = max(0.02, hihat_debounce - 0.01)
+                print(f"Hi-hat debounce: {hihat_debounce*1000:.0f}ms")
             
-            try:
-                while self.running:
-                    time.sleep(0.1)
-            except KeyboardInterrupt:
-                print("\n\nStopping detector...")
-                self.stop()
-        
+            elif cmd == "m+":
+                min_energy += 5.0
+                print(f"Minimum energy: {min_energy:.1f}")
+            elif cmd == "m-":
+                min_energy = max(0.0, min_energy - 5.0)
+                print(f"Minimum energy: {min_energy:.1f}")
+            
+            elif cmd == "show":
+                show_settings()
+            elif cmd == "help":
+                show_help()
+            elif cmd == "midi":
+                if out != None:
+                    out.close()
+                for i,p in enumerate(outports):
+                    print(f"{i + 1}: {p}")
+                output_port = input("Select new output device: ")
+                out = mido.open_output(outports[int(output_port)-1])
+                print(f"New output port: {out}")
+            elif cmd:
+                print("Unknown command. Type 'help' for available commands.")
+                
+        except EOFError:
+            break
         except Exception as e:
-            print(f"Error starting detector: {e}")
-            self.stop()
+            print(f"Error: {e}")
+
+
+def list_audio_devices():
+    print("\n" + "="*60)
+    print("AVAILABLE AUDIO INPUT DEVICES")
+    print("="*60)
     
-    def stop(self):
-        """Stop the drum detector"""
-        self.running = False
-        
-        if self.stream is not None:
-            self.stream.stop_stream()
-            self.stream.close()
-            self.stream = None
-        
-        self.audio.terminate()
-        print("Detector stopped\n")
+    devices = sd.query_devices()
+    input_devices = []
     
-    def set_threshold(self, new_threshold):
-        """Change detection threshold"""
-        self.threshold = new_threshold
-        print(f"Threshold updated to: {new_threshold}")
+    for idx, device in enumerate(devices):
+        if device['max_input_channels'] > 0:
+            input_devices.append(idx)
+            print(f"[{idx}] {device['name']}")
+            print(f"    Channels: {device['max_input_channels']}, "
+                  f"Sample Rate: {int(device['default_samplerate'])} Hz")
+            print()
     
-    def set_kick_params(self, threshold_mult=None, snare_ratio=None, hihat_ratio=None, energy_mult=None):
-        """Fine-tune kick detection parameters"""
-        if threshold_mult is not None:
-            self.kick_threshold_mult = threshold_mult
-        if snare_ratio is not None:
-            self.kick_snare_ratio = snare_ratio
-        if hihat_ratio is not None:
-            self.kick_hihat_ratio = hihat_ratio
-        if energy_mult is not None:
-            self.kick_energy_mult = energy_mult
-        
-        print(f"Kick params: thresh_mult={self.kick_threshold_mult}, "
-              f"snare_ratio={self.kick_snare_ratio}, hihat_ratio={self.kick_hihat_ratio}, "
-              f"energy_mult={self.kick_energy_mult}")
+    return input_devices
+
+
+def select_device():
+    input_devices = list_audio_devices()
     
-    def set_snare_params(self, threshold_mult=None, energy_mult=None, kick_ratio=None):
-        """Fine-tune snare detection parameters"""
-        if threshold_mult is not None:
-            self.snare_threshold_mult = threshold_mult
-        if energy_mult is not None:
-            self.snare_energy_mult = energy_mult
-        if kick_ratio is not None:
-            self.snare_kick_ratio = kick_ratio
-        
-        print(f"Snare params: thresh_mult={self.snare_threshold_mult}, "
-              f"energy_mult={self.snare_energy_mult}, kick_ratio={self.snare_kick_ratio}")
+    if not input_devices:
+        print("ERROR: No input devices found!")
+        sys.exit(1)
     
-    def set_hihat_params(self, threshold_mult=None, kick_ratio=None, zcr_min=None):
-        """Fine-tune hi-hat detection parameters"""
-        if threshold_mult is not None:
-            self.hihat_threshold_mult = threshold_mult
-        if kick_ratio is not None:
-            self.hihat_kick_ratio = kick_ratio
-        if zcr_min is not None:
-            self.hihat_zcr_min = zcr_min
-        
-        print(f"Hi-hat params: thresh_mult={self.hihat_threshold_mult}, "
-              f"kick_ratio={self.hihat_kick_ratio}, zcr_min={self.hihat_zcr_min}")
+    while True:
+        try:
+            choice = input("Select device index: ")
+            device_idx = int(choice)
+            
+            if device_idx in input_devices:
+                device_info = sd.query_devices(device_idx)
+                print(f"\nSelected: {device_info['name']}")
+                print(f"Sample Rate: {int(device_info['default_samplerate'])} Hz")
+                print(f"Available Channels: {device_info['max_input_channels']}")
+                break
+            else:
+                print(f"Invalid device index. Please choose from: {input_devices}")
+        except ValueError:
+            print("Please enter a valid number")
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            sys.exit(0)
     
-    def list_devices(self):
-        """List all available audio input devices"""
-        print("\nAvailable Audio Input Devices:")
-        print("-" * 60)
+    max_channels = device_info['max_input_channels']
+    selected_channel = None
+    
+    if max_channels > 1:
+        print(f"\nselected device has {max_channels} input channels")
+        print("select channel/input audio source is connected to")
         
-        for i in range(self.audio.get_device_count()):
-            info = self.audio.get_device_info_by_index(i)
-            if info['maxInputChannels'] > 0:
-                print(f"  [{i}] {info['name']}")
-                print(f"      Channels: {info['maxInputChannels']}, "
-                      f"Sample Rate: {info['defaultSampleRate']:.0f} Hz")
+        for i in range(max_channels):
+            print(f"  [{i+1}] Input {i+1} (Channel {i+1})")
         
-        print("-" * 60 + "\n")
+        while True:
+            try:
+                channel_choice = input(f"\nSelect input (1-{max_channels}): ")
+                channel_num = int(channel_choice)
+                
+                if 1 <= channel_num <= max_channels:
+                    selected_channel = channel_num - 1
+                    print(f"Using Input {channel_num}\n")
+                    break
+                else:
+                    print(f"Please enter a number between 1 and {max_channels}")
+            except ValueError:
+                print("Please enter a valid number")
+            except KeyboardInterrupt:
+                print("\nExiting")
+                sys.exit(0)
+    else:
+        selected_channel = 0
+        print("Using single available input (Channel 0)\n")
+    
+    return device_idx, int(device_info['default_samplerate']), selected_channel
+
+
+def find_dominant_frequency(audio_data, sample_rate):
+    fft_data = np.fft.rfft(audio_data)
+    magnitude = np.abs(fft_data)
+    peak_idx = np.argmax(magnitude)
+    frequency = peak_idx * sample_rate / len(audio_data)
+    
+    return frequency, magnitude[peak_idx]
+
+def calculate_band_energies(audio_data, sample_rate):
+    fft_data = np.fft.rfft(audio_data)
+    magnitude = np.abs(fft_data)
+    freq_resolution = sample_rate / len(audio_data)
+    bands = {
+        'kick': (20, 1000),
+        'snare': (1001, 3000),
+        'hihat': (3000, 24000)
+    }
+    
+    energies = {}
+    
+    for band_name, (low_freq, high_freq) in bands.items():
+        low_bin = int(low_freq / freq_resolution)
+        high_bin = int(high_freq / freq_resolution)
+        
+        high_bin = min(high_bin, len(magnitude))
+        
+        band_energy = np.sum(magnitude[low_bin:high_bin])
+        energies[band_name] = band_energy
+    
+    return energies
+
+
+def audio_callback_debug(indata, frames, time, status):
+    if status:
+        print(f"Status: {status}")
+    
+    if indata.shape[1] > 1:
+        audio_data = indata[:, selected_channel]
+    else:
+        audio_data = indata[:, 0]
+    audio_level = np.abs(audio_data).max()
+    frequency, magnitude = find_dominant_frequency(audio_data, sample_rate)
+    
+    if audio_level > 0.001:
+        print(f"Freq: {frequency:7.2f} Hz  |  Mag: {magnitude:10.2f}  |  Level: {audio_level:.4f}")
+
+
+def audio_callback_drum(indata, frames, time_info, status):
+    global last_detection, start_time
+    
+    if status:
+        print(f"Status: {status}")
+    
+    if indata.shape[1] > 1:
+        audio_data = indata[:, selected_channel]
+    else:
+        audio_data = indata[:, 0]
+    
+    audio_level = np.abs(audio_data).max()
+    energies = calculate_band_energies(audio_data, sample_rate)
+    current_time = time_info.currentTime if start_time is None else time_info.currentTime - start_time
+    if start_time is None:
+        start_time = time_info.currentTime
+        current_time = 0
+    
+    kick_onset = energies['kick'] > kick_threshold
+    snare_onset = energies['snare'] > snare_threshold
+    hihat_onset = energies['hihat'] > hihat_threshold
+    
+    kick_debounced = (current_time - last_detection['kick']) > kick_debounce
+    snare_debounced = (current_time - last_detection['snare']) > snare_debounce
+    hihat_debounced = (current_time - last_detection['hihat']) > hihat_debounce
+    
+    total_energy = energies['kick'] + energies['snare'] + energies['hihat']
+    
+    if kick_onset and kick_debounced and total_energy > min_energy:
+        if energies['kick'] / total_energy > 0.5:
+            print(f"[KICK]    Time: {current_time:.3f}s  |  Freq Band: 20-1000Hz  |  Energy: {energies['kick']:.1f}  |  Level: {audio_level:.4f}")
+            if out:
+                out.send(mido.Message('note_on', note=60))
+                out.send(mido.Message('note_off', note=60))
+            last_detection['kick'] = current_time
+    
+    if snare_onset and snare_debounced and total_energy > min_energy:
+        if energies['snare'] / total_energy > 0.3:
+            print(f"[SNARE]   Time: {current_time:.3f}s  |  Freq Band: 1000-3000Hz  |  Energy: {energies['snare']:.1f}  |  Level: {audio_level:.4f}")
+            if out:
+                out.send(mido.Message('note_on', note=70))
+                out.send(mido.Message('note_off', note=70))
+            last_detection['snare'] = current_time
+    
+    if hihat_onset and hihat_debounced and total_energy > min_energy:
+        if energies['hihat'] / total_energy > 0.4:
+            print(f"[HI-HAT]  Time: {current_time:.3f}s  |  Freq Band: 3000Hz+  |  Energy: {energies['hihat']:.1f}  |  Level: {audio_level:.4f}")
+            if out:
+                out.send(mido.Message('note_on', note=80))
+                out.send(mido.Message('note_off', note=80))
+            last_detection['hihat'] = current_time
+
+
+def audio_callback(indata, frames, time, status):
+    if mode == "debug":
+        audio_callback_debug(indata, frames, time, status)
+    elif mode == "butcher":
+        audio_callback_drum(indata, frames, time, status)
+
+
+def main():
+    global selected_device, sample_rate, selected_channel, mode
+    
+    print("\n" + "="*60)
+    print("butcher")
+    print("="*60)
+    print("Press Ctrl+C to stop at any time")
+    
+    mode = select_mode()
+    
+    selected_device, sample_rate, selected_channel = select_device()
+    
+    print("Starting audio stream...")
+    print("Butcher listening\n")
+    
+    if mode == "butcher":
+        control_thread = threading.Thread(target=parameter_control_thread, daemon=True)
+        control_thread.start()
+    
+    try:
+        with sd.InputStream(
+            device=selected_device,
+            channels=2,
+            samplerate=sample_rate,
+            blocksize=BUFFER_SIZE,
+            callback=audio_callback
+        ):
+            print("Press Ctrl+C to stop\n")
+            while True:
+                sd.sleep(1000)
+                
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+    except Exception as e:
+        print(f"\nError: {e}")
+    finally:
+        print("Audio stream closed.")
 
 
 if __name__ == "__main__":
-    detector = DrumDetector(
-        sample_rate=48000,
-        threshold=0.04,
-        input_device=2,  # BlackHole 2ch
-        
-        kick_threshold_mult=2.0, 
-        kick_snare_ratio=2.0,     
-        kick_hihat_ratio=1.5,       
-        kick_energy_mult=1.2,       
-        
-        snare_threshold_mult=0.5,   
-        snare_energy_mult=0.4,     
-        snare_kick_ratio=0.3,     
-        
-        hihat_threshold_mult=0.15,
-        hihat_kick_ratio=0.8,
-        hihat_zcr_min=0.05,
-        
-    )
-    
-    # Show available devices
-    detector.list_devices()
-    
-#    detector.set_kick_params(threshold_mult=1.5)  # Make kick MORE sensitive
-    detector.set_hihat_params(threshold_mult=0.1)  # Make hi-hat more sensitive
-  #  detector.set_snare_params(threshold_mult=1.5)  # Make snare less sensitive
-    
-    # Start detecting
-    try:
-        detector.start()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    finally:
-        detector.stop()
+    main()
