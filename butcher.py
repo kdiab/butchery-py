@@ -33,8 +33,8 @@ words = [
 BUFFER_SIZE = 2048
 
 
-class ButcherApp(App):
-    """Butcher - Audio-triggered OSC word sender"""
+class Butcher(App):
+    """Butcher"""
     
     CSS = """
     Screen {
@@ -629,7 +629,7 @@ def main():
     if mode == "butcher":
         osc_client, osc_ip, osc_port = configure_osc()
     
-    app = ButcherApp()
+    app = Butcher()
     app.mode = mode
     app.selected_device = selected_device
     app.sample_rate = sample_rate
