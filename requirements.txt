@@ -17,6 +17,7 @@ platformdirs==4.4.0
 pooch==1.8.2
 PyAudio==0.2.14
 pycparser==2.23
+python-osc==1.9.3
 python-rtmidi==1.5.8
 requests==2.32.5
 scikit-learn==1.7.2
