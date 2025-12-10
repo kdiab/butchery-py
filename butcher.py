@@ -12,23 +12,9 @@ from textual.binding import Binding
 
 # random ass word list - change later
 words = [
-    "galaxy", "whisper", "cascade", "ember", "horizon",
-    "shadow", "crystal", "thunder", "velvet", "marble",
-    "spiral", "ocean", "midnight", "silver", "volcano",
-    "eclipse", "diamond", "forest", "lightning", "phoenix",
-    "cosmos", "glacier", "tempest", "crimson", "nebula",
-    "amber", "thunder", "sapphire", "tornado", "zenith",
-    "aurora", "bronze", "cavern", "delta", "emerald",
-    "falcon", "granite", "harbor", "ivory", "jungle",
-    "karma", "lava", "magnet", "nova", "onyx",
-    "prism", "quartz", "raven", "storm", "tiger",
-    "urban", "vortex", "winter", "xenon", "yellow",
-    "zebra", "anchor", "blade", "cipher", "dragon",
-    "echo", "flame", "ghost", "hammer", "iron",
-    "javelin", "knight", "lotus", "meteor", "nectar",
-    "orbit", "pulse", "quantum", "rocket", "solar",
-    "titan", "ultra", "vertex", "wave", "xerox"
-]
+    "FOLLOW","@MEATATLANTA"
+    ]
+
 
 BUFFER_SIZE = 2048
 
